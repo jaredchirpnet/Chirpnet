@@ -12,7 +12,7 @@ rm -rf "$ROOTFS_DIR"
 mkdir -p "$ROOTFS_DIR"
 
 echo "Bootstrapping Debian ${RELEASE} arm64 root filesystem..."
-sudo debootstrap --arch=arm64 --variant=minbase "$RELEASE" "$ROOTFS_DIR" "http://deb.debian.org/debian"
+sudo debootstrap --arch=arm64 --variant=minbase --foreign "$RELEASE" "$ROOTFS_DIR" "http://deb.debian.org/debian"
 
 # QEMU static for chroot emulation.
 sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS_DIR/usr/bin/"

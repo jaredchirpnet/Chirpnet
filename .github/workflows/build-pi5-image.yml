@@ -1,0 +1,70 @@
+name: Build Debian Pi 5 Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/build-pi5-image.sh"
+      - ".github/workflows/build-pi5-image.yml"
+  workflow_dispatch:
+    inputs:
+      debian_release:
+        description: "Debian release codename"
+        required: false
+        default: "bookworm"
+      image_size:
+        description: "Image size (e.g. 8G)"
+        required: false
+        default: "8G"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          echo "Before cleanup:"
+          df -h /
+
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/lib/jvm
+          sudo docker image prune -af || true
+
+          echo "After cleanup:"
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            debootstrap \
+            qemu-user-static \
+            binfmt-support \
+            parted \
+            dosfstools \
+            e2fsprogs \
+            rsync \
+            xz-utils \
+            util-linux
+
+      - name: Build image
+        env:
+          DEBIAN_RELEASE: ${{ github.event.inputs.debian_release || 'bookworm' }}
+          IMAGE_SIZE: ${{ github.event.inputs.image_size || '8G' }}
+        run: sudo -E bash scripts/build-pi5-image.sh
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-pi5-${{ env.DEBIAN_RELEASE || 'bookworm' }}
+          path: build/*.img.xz
+          if-no-files-found: error
+          retention-days: 14

@@ -48,13 +48,20 @@ case "$ROOTFS_DIR" in
   *..*) echo "ERROR: ROOTFS_DIR must not contain '..'" >&2; exit 1 ;;
 esac
 
-# The chroot runs arm64 binaries (and their children) via qemu-user; without a
-# registered binfmt handler, nested exec calls fail with confusing errors.
-if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
-  echo "ERROR: qemu-aarch64 binfmt handler is not registered." >&2
-  echo "Install qemu-user-static and binfmt-support, or run: sudo update-binfmts --enable qemu-aarch64" >&2
-  exit 1
-fi
+# On a non-arm64 host the chroot runs arm64 binaries (and their children) via
+# qemu-user; without a registered binfmt handler, nested exec calls fail with
+# confusing errors. On an arm64 host everything runs natively.
+case "$(uname -m)" in
+  aarch64|arm64) QEMU_BIN="" ;;
+  *)
+    QEMU_BIN="/usr/bin/qemu-aarch64-static"
+    if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+      echo "ERROR: qemu-aarch64 binfmt handler is not registered." >&2
+      echo "Install qemu-user-static and binfmt-support, or run: sudo update-binfmts --enable qemu-aarch64" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 mkdir -p "$(dirname "$IMG_FILE")"
 rm -rf "$ROOTFS_DIR"
@@ -63,7 +70,9 @@ mkdir -p "$ROOTFS_DIR"
 echo "Bootstrapping Debian ${RELEASE} arm64 root filesystem..."
 sudo debootstrap --arch=arm64 --variant=minbase --foreign "$RELEASE" "$ROOTFS_DIR" "http://deb.debian.org/debian"
 
-sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS_DIR/usr/bin/"
+if [ -n "$QEMU_BIN" ]; then
+  sudo cp "$QEMU_BIN" "$ROOTFS_DIR/usr/bin/"
+fi
 sudo mkdir -p "$ROOTFS_DIR/boot/firmware"
 
 sudo mount -t proc proc "$ROOTFS_DIR/proc"
@@ -73,7 +82,7 @@ sudo mount --bind /dev/pts "$ROOTFS_DIR/dev/pts"
 
 echo "Configuring Debian for Raspberry Pi 5..."
 sudo install -m 0755 "$SCRIPT_DIR/pi5-chroot-setup.sh" "$ROOTFS_DIR/tmp/pi5-chroot-setup.sh"
-sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-aarch64-static /usr/bin/env \
+sudo chroot "$ROOTFS_DIR" ${QEMU_BIN:+"$QEMU_BIN"} /usr/bin/env \
   RELEASE="$RELEASE" JLINK_MODULES="$JLINK_MODULES" \
   TEDGE_PACKAGES="$TEDGE_PACKAGES" TEDGE_REPO="$TEDGE_REPO" \
   /bin/bash /tmp/pi5-chroot-setup.sh

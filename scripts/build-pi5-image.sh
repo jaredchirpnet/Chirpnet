@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOTFS_DIR="${ROOTFS_DIR:-$(pwd)/build/rootfs}"
-IMG_FILE="${IMG_FILE:-$(pwd)/build/debian-pi5-bookworm.img}"
 RELEASE="${DEBIAN_RELEASE:-bookworm}"
+IMG_FILE="${IMG_FILE:-$(pwd)/build/debian-pi5-${RELEASE}.img}"
 IMAGE_SIZE="${IMAGE_SIZE:-8G}"
 BOOT_SIZE="${BOOT_SIZE:-256MiB}"
 
@@ -23,6 +23,25 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+# rm -rf below is destructive and ROOTFS_DIR is overridable: refuse anything
+# that is not an absolute path strictly inside the build directory.
+BUILD_DIR="$(pwd)/build"
+case "$ROOTFS_DIR" in
+  "$BUILD_DIR"/?*) ;;
+  *) echo "ERROR: ROOTFS_DIR ($ROOTFS_DIR) must be a subdirectory of $BUILD_DIR" >&2; exit 1 ;;
+esac
+case "$ROOTFS_DIR" in
+  *..*) echo "ERROR: ROOTFS_DIR must not contain '..'" >&2; exit 1 ;;
+esac
+
+# The chroot runs arm64 binaries (and their children) via qemu-user; without a
+# registered binfmt handler, nested exec calls fail with confusing errors.
+if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+  echo "ERROR: qemu-aarch64 binfmt handler is not registered." >&2
+  echo "Install qemu-user-static and binfmt-support, or run: sudo update-binfmts --enable qemu-aarch64" >&2
+  exit 1
+fi
 
 mkdir -p "$(dirname "$IMG_FILE")"
 rm -rf "$ROOTFS_DIR"

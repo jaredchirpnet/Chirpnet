@@ -20,6 +20,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      DEBIAN_RELEASE: ${{ github.event.inputs.debian_release || 'bookworm' }}
+      IMAGE_SIZE: ${{ github.event.inputs.image_size || '8G' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,16 +58,18 @@ jobs:
             xz-utils \
             util-linux
 
+      - name: Verify qemu binfmt handler
+        run: |
+          sudo update-binfmts --enable qemu-aarch64 || true
+          ls /proc/sys/fs/binfmt_misc/ | grep qemu-aarch64
+
       - name: Build image
-        env:
-          DEBIAN_RELEASE: ${{ github.event.inputs.debian_release || 'bookworm' }}
-          IMAGE_SIZE: ${{ github.event.inputs.image_size || '8G' }}
         run: sudo -E bash scripts/build-pi5-image.sh
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v4
         with:
-          name: debian-pi5-${{ env.DEBIAN_RELEASE || 'bookworm' }}
+          name: debian-pi5-${{ env.DEBIAN_RELEASE }}
           path: build/*.img.xz
           if-no-files-found: error
           retention-days: 14

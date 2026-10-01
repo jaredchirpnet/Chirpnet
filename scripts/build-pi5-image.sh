@@ -7,6 +7,23 @@ RELEASE="${DEBIAN_RELEASE:-bookworm}"
 IMAGE_SIZE="${IMAGE_SIZE:-8G}"
 BOOT_SIZE="${BOOT_SIZE:-256MiB}"
 
+BOOT_MNT="$(pwd)/mnt/boot"
+ROOT_MNT="$(pwd)/mnt/root"
+LOOP_DEVICE=""
+
+cleanup() {
+  # Unmount the chroot's pseudo-filesystems first; they are nested deepest.
+  for d in dev/pts dev proc sys; do
+    sudo umount -l "$ROOTFS_DIR/$d" 2>/dev/null || true
+  done
+  sudo umount -l "$BOOT_MNT" 2>/dev/null || true
+  sudo umount -l "$ROOT_MNT" 2>/dev/null || true
+  if [ -n "$LOOP_DEVICE" ]; then
+    sudo losetup -d "$LOOP_DEVICE" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
 mkdir -p "$(dirname "$IMG_FILE")"
 rm -rf "$ROOTFS_DIR"
 mkdir -p "$ROOTFS_DIR"
@@ -17,47 +34,57 @@ sudo debootstrap --arch=arm64 --variant=minbase --foreign "$RELEASE" "$ROOTFS_DI
 # QEMU static for chroot emulation.
 sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS_DIR/usr/bin/"
 
-# Create /boot/firmware directory for raspi-firmware post-install script
+# raspi-firmware installs into /boot/firmware; it must exist before apt runs.
 sudo mkdir -p "$ROOTFS_DIR/boot/firmware"
 
+# Pseudo-filesystems the kernel/initramfs postinst scripts expect.
+sudo mount -t proc proc "$ROOTFS_DIR/proc"
+sudo mount -t sysfs sys "$ROOTFS_DIR/sys"
+sudo mount --bind /dev "$ROOTFS_DIR/dev"
+sudo mount --bind /dev/pts "$ROOTFS_DIR/dev/pts"
+
 echo "Configuring Debian for Raspberry Pi 5..."
-sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-aarch64-static /bin/bash -lc '
+sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-aarch64-static /bin/bash -c "
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+RELEASE='${RELEASE}'
 
 /debootstrap/debootstrap --second-stage
 
-# Configure APT sources first to include non-free-firmware
+# Configure APT sources first so non-free-firmware is available to the installs below.
 cat > /etc/apt/sources.list <<EOF
-deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
-# deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
-# deb http://deb.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian \${RELEASE} main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian \${RELEASE}-updates main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security \${RELEASE}-security main contrib non-free non-free-firmware
 EOF
 
 apt-get update
-apt-get install -y --no-install-recommends \
-  systemd-sysv \
-  dbus \
-  sudo \
-  iproute2 \
-  netbase \
-  openssh-server \
-  ca-certificates \
-  firmware-brcm80211 \
-  raspi-firmware \
-  linux-image-arm64 \
+apt-get install -y --no-install-recommends \\
+  systemd-sysv \\
+  dbus \\
+  sudo \\
+  iproute2 \\
+  netbase \\
+  openssh-server \\
+  ca-certificates \\
+  firmware-brcm80211 \\
+  raspi-firmware \\
+  linux-image-arm64 \\
   initramfs-tools
 
 useradd -m -s /bin/bash -G sudo pi
-printf "pi:raspberry\nroot:raspberry\n" | chpasswd
+printf 'pi:raspberry\nroot:raspberry\n' | chpasswd
+# Force a password change on first login; the defaults above are public knowledge.
+chage -d 0 pi
+passwd -l root
 
 systemctl enable ssh
 
-cat > /etc/hostname <<"EOF"
+cat > /etc/hostname <<EOF
 pi5
 EOF
 
-cat > /etc/hosts <<"EOF"
+cat > /etc/hosts <<EOF
 127.0.0.1 localhost
 127.0.1.1 pi5
 ::1 localhost ip6-localhost ip6-loopback
@@ -65,14 +92,19 @@ ff02::1 ip6-allnodes
 ff02::2 ip6-allrouters
 EOF
 
-cat > /etc/modules <<"EOF"
+cat > /etc/modules <<EOF
 # /etc/modules: kernel modules to load at boot time.
-bcm2712
 brcmfmac
 EOF
 
 apt-get clean
-'
+"
+
+# Pseudo-filesystems are no longer needed; unmount before copying the rootfs out.
+sudo umount "$ROOTFS_DIR/dev/pts"
+sudo umount "$ROOTFS_DIR/dev"
+sudo umount "$ROOTFS_DIR/sys"
+sudo umount "$ROOTFS_DIR/proc"
 
 # Create disk image with a boot and root partition.
 truncate -s "$IMAGE_SIZE" "$IMG_FILE"
@@ -89,42 +121,33 @@ PART_ROOT="${LOOP_DEVICE}p2"
 sudo mkfs.vfat -F 32 "$PART_BOOT"
 sudo mkfs.ext4 -F "$PART_ROOT"
 
-BOOT_MNT="$(pwd)/mnt/boot"
-ROOT_MNT="$(pwd)/mnt/root"
 mkdir -p "$BOOT_MNT" "$ROOT_MNT"
 
-sudo mount "$PART_BOOT" "$BOOT_MNT"
 sudo mount "$PART_ROOT" "$ROOT_MNT"
+sudo mount "$PART_BOOT" "$BOOT_MNT"
 
-sudo rsync -aHAX --delete "$ROOTFS_DIR"/ "$ROOT_MNT"/
+sudo rsync -aHAX --delete --exclude '/boot/firmware/*' "$ROOTFS_DIR"/ "$ROOT_MNT"/
 
-# Copy boot files to the FAT32 partition.
-if [ -d "$ROOTFS_DIR/boot/firmware" ]; then
-  sudo mkdir -p "$BOOT_MNT/firmware"
-  sudo rsync -aHAX --delete "$ROOTFS_DIR/boot/firmware"/ "$BOOT_MNT/firmware"/
-fi
-
-if [ -d "$ROOTFS_DIR/boot" ]; then
-  sudo rsync -aHAX --delete "$ROOTFS_DIR/boot"/ "$BOOT_MNT"/
-fi
+# The FAT partition IS /boot/firmware. Its contents go at the partition root,
+# where the Pi 5 bootloader looks for config.txt, the .dtb files and start*.elf.
+sudo rsync -aHAX --delete "$ROOTFS_DIR/boot/firmware"/ "$BOOT_MNT"/
 
 BOOT_PARTUUID="$(sudo blkid -s PARTUUID -o value "$PART_BOOT")"
 ROOT_PARTUUID="$(sudo blkid -s PARTUUID -o value "$PART_ROOT")"
 
 sudo tee "$ROOT_MNT/etc/fstab" >/dev/null <<EOF
 PARTUUID=${ROOT_PARTUUID}  /               ext4    defaults,noatime  0 1
-PARTUUID=${BOOT_PARTUUID}  /boot           vfat    defaults        0 2
+PARTUUID=${BOOT_PARTUUID}  /boot/firmware  vfat    defaults          0 2
 EOF
 
-sudo tee "$BOOT_MNT/config.txt" >/dev/null <<EOF
+# raspi-firmware generates config.txt itself. Append only Pi 5 specifics, and
+# leave its kernel/initramfs directives untouched.
+sudo tee -a "$BOOT_MNT/config.txt" >/dev/null <<EOF
+
 [pi5]
-kernel=vmlinuz
-arm_64bit=1
 enable_uart=1
 dtoverlay=vc4-kms-v3d
 dtparam=audio=off
-gpu_mem=16
-cmdline=cmdline.txt
 EOF
 
 sudo tee "$BOOT_MNT/cmdline.txt" >/dev/null <<EOF
@@ -133,6 +156,7 @@ EOF
 
 sudo umount "$BOOT_MNT" "$ROOT_MNT"
 sudo losetup -d "$LOOP_DEVICE"
+LOOP_DEVICE=""
 
 xz -T0 -c "$IMG_FILE" > "${IMG_FILE}.xz"
 

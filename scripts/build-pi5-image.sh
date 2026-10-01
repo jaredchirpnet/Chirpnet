@@ -17,6 +17,9 @@ sudo debootstrap --arch=arm64 --variant=minbase --foreign "$RELEASE" "$ROOTFS_DI
 # QEMU static for chroot emulation.
 sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS_DIR/usr/bin/"
 
+# Create /boot/firmware directory for raspi-firmware post-install script
+sudo mkdir -p "$ROOTFS_DIR/boot/firmware"
+
 echo "Configuring Debian for Raspberry Pi 5..."
 sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-aarch64-static /bin/bash -lc '
 set -euo pipefail

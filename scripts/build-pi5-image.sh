@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
+# Builds a minimal Debian arm64 image for the Raspberry Pi 5 that runs
+# thin-edge.io (tedge) and a jlink-minimised JRE.
+#
+# Env (all optional):
+#   DEBIAN_RELEASE  Debian codename                       (default: trixie)
+#   IMAGE_SIZE      total image size, e.g. 2G, or "auto"  (default: auto = fit contents)
+#   BOOT_SIZE       FAT partition size in MiB, or "auto"  (default: auto)
+#   JLINK_MODULES   comma-separated JDK modules for the JRE (default: java.base)
+#   TEDGE_PACKAGES  tedge apt packages to install          (default: tedge-minimal)
+#   TEDGE_REPO      Cloudsmith repo name                   (default: tedge-release)
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RELEASE="${DEBIAN_RELEASE:-trixie}"
 ROOTFS_DIR="${ROOTFS_DIR:-$(pwd)/build/rootfs}"
-RELEASE="${DEBIAN_RELEASE:-bookworm}"
 IMG_FILE="${IMG_FILE:-$(pwd)/build/debian-pi5-${RELEASE}.img}"
-IMAGE_SIZE="${IMAGE_SIZE:-8G}"
-BOOT_SIZE="${BOOT_SIZE:-256MiB}"
+IMAGE_SIZE="${IMAGE_SIZE:-auto}"
+BOOT_SIZE="${BOOT_SIZE:-auto}"
+JLINK_MODULES="${JLINK_MODULES:-java.base}"
+TEDGE_PACKAGES="${TEDGE_PACKAGES:-tedge-minimal}"
+TEDGE_REPO="${TEDGE_REPO:-tedge-release}"
 
 BOOT_MNT="$(pwd)/mnt/boot"
 ROOT_MNT="$(pwd)/mnt/root"
 LOOP_DEVICE=""
 
 cleanup() {
-  # Unmount the chroot's pseudo-filesystems first; they are nested deepest.
   for d in dev/pts dev proc sys; do
     sudo umount -l "$ROOTFS_DIR/$d" 2>/dev/null || true
   done
@@ -50,95 +63,63 @@ mkdir -p "$ROOTFS_DIR"
 echo "Bootstrapping Debian ${RELEASE} arm64 root filesystem..."
 sudo debootstrap --arch=arm64 --variant=minbase --foreign "$RELEASE" "$ROOTFS_DIR" "http://deb.debian.org/debian"
 
-# QEMU static for chroot emulation.
 sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS_DIR/usr/bin/"
-
-# raspi-firmware installs into /boot/firmware; it must exist before apt runs.
 sudo mkdir -p "$ROOTFS_DIR/boot/firmware"
 
-# Pseudo-filesystems the kernel/initramfs postinst scripts expect.
 sudo mount -t proc proc "$ROOTFS_DIR/proc"
 sudo mount -t sysfs sys "$ROOTFS_DIR/sys"
 sudo mount --bind /dev "$ROOTFS_DIR/dev"
 sudo mount --bind /dev/pts "$ROOTFS_DIR/dev/pts"
 
 echo "Configuring Debian for Raspberry Pi 5..."
-sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-aarch64-static /bin/bash -c "
-set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
-RELEASE='${RELEASE}'
+sudo install -m 0755 "$SCRIPT_DIR/pi5-chroot-setup.sh" "$ROOTFS_DIR/tmp/pi5-chroot-setup.sh"
+sudo chroot "$ROOTFS_DIR" /usr/bin/qemu-aarch64-static /usr/bin/env \
+  RELEASE="$RELEASE" JLINK_MODULES="$JLINK_MODULES" \
+  TEDGE_PACKAGES="$TEDGE_PACKAGES" TEDGE_REPO="$TEDGE_REPO" \
+  /bin/bash /tmp/pi5-chroot-setup.sh
+sudo rm -f "$ROOTFS_DIR/tmp/pi5-chroot-setup.sh"
 
-/debootstrap/debootstrap --second-stage
-
-# Configure APT sources first so non-free-firmware is available to the installs below.
-cat > /etc/apt/sources.list <<EOF
-deb http://deb.debian.org/debian \${RELEASE} main contrib non-free non-free-firmware
-deb http://deb.debian.org/debian \${RELEASE}-updates main contrib non-free non-free-firmware
-deb http://security.debian.org/debian-security \${RELEASE}-security main contrib non-free non-free-firmware
-EOF
-
-apt-get update
-apt-get install -y --no-install-recommends \\
-  systemd-sysv \\
-  dbus \\
-  sudo \\
-  iproute2 \\
-  netbase \\
-  openssh-server \\
-  ca-certificates \\
-  firmware-brcm80211 \\
-  raspi-firmware \\
-  linux-image-arm64 \\
-  initramfs-tools
-
-useradd -m -s /bin/bash -G sudo pi
-printf 'pi:raspberry\nroot:raspberry\n' | chpasswd
-# Force a password change on first login; the defaults above are public knowledge.
-chage -d 0 pi
-passwd -l root
-
-systemctl enable ssh
-
-cat > /etc/hostname <<EOF
-pi5
-EOF
-
-cat > /etc/hosts <<EOF
-127.0.0.1 localhost
-127.0.1.1 pi5
-::1 localhost ip6-localhost ip6-loopback
-ff02::1 ip6-allnodes
-ff02::2 ip6-allrouters
-EOF
-
-cat > /etc/modules <<EOF
-# /etc/modules: kernel modules to load at boot time.
-brcmfmac
-EOF
-
-apt-get clean
-"
-
-# Pseudo-filesystems are no longer needed; unmount before copying the rootfs out.
 sudo umount "$ROOTFS_DIR/dev/pts"
 sudo umount "$ROOTFS_DIR/dev"
 sudo umount "$ROOTFS_DIR/sys"
 sudo umount "$ROOTFS_DIR/proc"
 
-# Create disk image with a boot and root partition.
-truncate -s "$IMAGE_SIZE" "$IMG_FILE"
+# --- Size the image from what is actually in the rootfs -----------------------
+BOOT_USED_MIB="$(sudo du -sm "$ROOTFS_DIR/boot/firmware" | cut -f1)"
+TOTAL_USED_MIB="$(sudo du -sxm "$ROOTFS_DIR" | cut -f1)"
+
+if [ "$BOOT_SIZE" = auto ]; then
+  BOOT_MIB=$(( BOOT_USED_MIB * 130 / 100 + 8 ))
+  [ "$BOOT_MIB" -lt 64 ] && BOOT_MIB=64     # FAT32 needs >= ~33 MiB
+else
+  BOOT_MIB="${BOOT_SIZE%MiB}"
+fi
+BOOT_END_MIB=$(( 1 + BOOT_MIB ))
+
+if [ "$IMAGE_SIZE" = auto ]; then
+  # 15% headroom plus ~64 MiB for the ext4 journal/metadata. The partition is
+  # grown to the full device on first boot (growroot.service).
+  ROOT_MIB=$(( (TOTAL_USED_MIB - BOOT_USED_MIB) * 115 / 100 + 64 ))
+  [ "$ROOT_MIB" -lt 256 ] && ROOT_MIB=256
+  IMAGE_TRUNCATE="$(( BOOT_END_MIB + ROOT_MIB ))M"
+else
+  IMAGE_TRUNCATE="$IMAGE_SIZE"
+fi
+echo "rootfs: ${TOTAL_USED_MIB} MiB used (boot ${BOOT_USED_MIB} MiB); image: ${IMAGE_TRUNCATE}, boot partition: ${BOOT_MIB} MiB"
+
+truncate -s "$IMAGE_TRUNCATE" "$IMG_FILE"
 
 sudo parted -s "$IMG_FILE" -- mklabel msdos
-sudo parted -s "$IMG_FILE" -- unit MiB mkpart primary fat32 1 "$BOOT_SIZE"
+sudo parted -s "$IMG_FILE" -- unit MiB mkpart primary fat32 1 "$BOOT_END_MIB"
 sudo parted -s "$IMG_FILE" -- set 1 boot on
-sudo parted -s "$IMG_FILE" -- unit MiB mkpart primary ext4 "$BOOT_SIZE" 100%
+sudo parted -s "$IMG_FILE" -- unit MiB mkpart primary ext4 "$BOOT_END_MIB" 100%
 
 LOOP_DEVICE="$(sudo losetup --show -fP "$IMG_FILE")"
 PART_BOOT="${LOOP_DEVICE}p1"
 PART_ROOT="${LOOP_DEVICE}p2"
 
-sudo mkfs.vfat -F 32 "$PART_BOOT"
-sudo mkfs.ext4 -F "$PART_ROOT"
+sudo mkfs.vfat -F 32 -n BOOT "$PART_BOOT"
+sudo mkfs.ext4 -F -m 0 -L rootfs "$PART_ROOT"
 
 mkdir -p "$BOOT_MNT" "$ROOT_MNT"
 
@@ -177,6 +158,6 @@ sudo umount "$BOOT_MNT" "$ROOT_MNT"
 sudo losetup -d "$LOOP_DEVICE"
 LOOP_DEVICE=""
 
-xz -T0 -c "$IMG_FILE" > "${IMG_FILE}.xz"
+xz -9e -T0 -c "$IMG_FILE" > "${IMG_FILE}.xz"
 
 ls -lh "$IMG_FILE" "${IMG_FILE}.xz"

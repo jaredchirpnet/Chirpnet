@@ -5,24 +5,35 @@ on:
     branches: [main]
     paths:
       - "scripts/build-pi5-image.sh"
+      - "scripts/pi5-chroot-setup.sh"
       - ".github/workflows/build-pi5-image.yml"
   workflow_dispatch:
     inputs:
       debian_release:
         description: "Debian release codename"
         required: false
-        default: "bookworm"
+        default: "trixie"
       image_size:
-        description: "Image size (e.g. 8G)"
+        description: "Image size (e.g. 2G) or auto to fit contents"
         required: false
-        default: "8G"
+        default: "auto"
+      jlink_modules:
+        description: "Comma-separated JDK modules for the minimal JRE"
+        required: false
+        default: "java.base"
+      tedge_packages:
+        description: "thin-edge.io apt packages to install"
+        required: false
+        default: "tedge-minimal"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      DEBIAN_RELEASE: ${{ github.event.inputs.debian_release || 'bookworm' }}
-      IMAGE_SIZE: ${{ github.event.inputs.image_size || '8G' }}
+      DEBIAN_RELEASE: ${{ github.event.inputs.debian_release || 'trixie' }}
+      IMAGE_SIZE: ${{ github.event.inputs.image_size || 'auto' }}
+      JLINK_MODULES: ${{ github.event.inputs.jlink_modules || 'java.base' }}
+      TEDGE_PACKAGES: ${{ github.event.inputs.tedge_packages || 'tedge-minimal' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4

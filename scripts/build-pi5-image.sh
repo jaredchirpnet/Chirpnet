@@ -24,6 +24,13 @@ export DEBIAN_FRONTEND=noninteractive
 
 /debootstrap/debootstrap --second-stage
 
+# Configure APT sources first to include non-free-firmware
+cat > /etc/apt/sources.list <<EOF
+deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+# deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+# deb http://deb.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+EOF
+
 apt-get update
 apt-get install -y --no-install-recommends \
   systemd-sysv \
@@ -59,12 +66,6 @@ cat > /etc/modules <<"EOF"
 # /etc/modules: kernel modules to load at boot time.
 bcm2712
 brcmfmac
-EOF
-
-cat > /etc/apt/sources.list <<"EOF"
-deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
-# deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
-# deb http://deb.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
 EOF
 
 apt-get clean
